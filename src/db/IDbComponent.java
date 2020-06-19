@@ -12,13 +12,38 @@ public interface IDbComponent {
 	 * @return
 	 * @throws Exception
 	 */
+	public <TEntity extends IEntity> void cacheEntityEnums() throws Exception;
+	
+	/**
+	 * @param tables
+	 * @return
+	 * @throws Exception
+	 */
 	public Map<String, List<IEntity>> collect(String[] tables) throws Exception;
+	/**
+	 * @param table
+	 * @return
+	 * @throws Exception
+	 */
+	public List<IEntity> collect(String table) throws Exception;
 	/**
 	 * @param queryEntitiesMap
 	 * @return
 	 * @throws Exception
 	 */
 	public List<IEntity> filter(List<QueryContainer> queryContainers) throws Exception;
+	/**
+	 * @param queryContainer
+	 * @return
+	 * @throws Exception
+	 */
+	public List<IEntity> filter(QueryContainer queryContainer) throws Exception;
+	/**
+	 * @param entity
+	 * @return
+	 * @throws Exception
+	 */
+	public List<IEntity> filter(IEntity entity) throws Exception;
 	/**
 	 * @param entity
 	 * @return
@@ -35,7 +60,13 @@ public interface IDbComponent {
 	 * @throws Exception
 	 */
 	public void remove(IEntity entity) throws Exception;
-	
+	/**
+	 * @param queryEntitiesMap
+	 * @return
+	 * @throws Exception
+	 */
+	public void remove(List<QueryContainer> queryContainers) throws Exception;
+
 	/**
 	 * @param host
 	 */

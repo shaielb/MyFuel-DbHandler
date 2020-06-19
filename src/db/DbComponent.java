@@ -1,29 +1,29 @@
 package db;
 
 import java.net.URISyntaxException;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 
-import annotations.Table;
-import comperators.Comperators;
 import configuration.Configuration;
 import db.connections.MySqlConnection;
-import db.connections.MySqlConnection.StatementType;
 import db.interfaces.IEntity;
-import db.interfaces.IEntityBridge;
-import db.services.Services;
+import globals.Globals;
 import messages.QueryContainer;
 import pool.ObjectPool;
+import utilities.Cache;
 import utilities.EnvUtil;
 
-@SuppressWarnings({ "unchecked", "serial" })
+@SuppressWarnings({ "unchecked" })
 public class DbComponent implements IDbComponent {
+	public interface DbAction {
+		public List<IEntity> execute(MySqlConnection connection, String table, String where) throws Exception;
+	}
+
 	/**
 	 * 
 	 */
@@ -45,11 +45,6 @@ public class DbComponent implements IDbComponent {
 	 * 
 	 */
 	public static final String DefaultPassword = "1234";
-	
-	/**
-	 * 
-	 */
-	public static final String StringValueSign = "<Value>";
 
 	/**
 	 * 
@@ -77,15 +72,12 @@ public class DbComponent implements IDbComponent {
 	 * 
 	 */
 	private ObjectPool<MySqlConnection> _connectionPool;
-	
-	/**
-	 * 
-	 */
-	private Map<String, String> _comperatorsMap = new HashMap<String, String>() {{
-		put(Comperators.StartsWith, "'" + StringValueSign  + "%'");
-		put(Comperators.EndsWith, "'%" + StringValueSign  + "'");
-		put(Comperators.Containes, "'%" + StringValueSign  + "%'");
-	}};
+
+	private DbCollect _dbCollect;
+	private DbFilter _dbFilter;
+	private DbInsert _dbInsert;
+	private DbUpdate _dbUpdate;
+	private DbRemove _dbRemove;
 
 	/**
 	 * 
@@ -110,6 +102,12 @@ public class DbComponent implements IDbComponent {
 					}
 					return connection;
 				});
+
+		_dbCollect = new DbCollect(_connectionPool);
+		_dbFilter = new DbFilter(_connectionPool, _dbCollect);
+		_dbInsert = new DbInsert(_connectionPool);
+		_dbUpdate = new DbUpdate(_connectionPool);
+		_dbRemove = new DbRemove(_connectionPool);
 	}
 
 	/**
@@ -155,285 +153,81 @@ public class DbComponent implements IDbComponent {
 	}
 
 	/**
-	 * @param connection
-	 * @param table
-	 * @param where
-	 * @return
-	 * @throws Exception
+	 *
 	 */
-	private List<IEntity> collect(MySqlConnection connection, String table, String where) throws Exception {
-		List<IEntity> list = new ArrayList<IEntity>();
-		IEntityBridge entityBridge = Services.getBridge(table);
-		ResultSet rs = connection.runQuery(String.format("select * from %s %s", table, where));
-
-		Map<String, String>[] fkMap = new HashMap[1];
-
+	@Override
+	public <TEntity extends IEntity> void cacheEntityEnums() throws Exception {
+		List<String> enumTables = new ArrayList<String>();
+		MySqlConnection connection = _connectionPool.pop();
+		ResultSet rs = connection.runQuery("show tables");
+		_connectionPool.push(connection);
 		while (rs.next()) {
-			IEntity newEntity = entityBridge.createEntity();
-			entityBridge.populateEntity(newEntity, 
-					(index, name, value) -> {
-						Object res = rs.getObject(index + 1);
-						if (name.endsWith("_fk")) {
-							if (fkMap[0] == null) {
-								fkMap[0] = connection.retrieveTableFkMap(table);
-							}
-							try {
-								IEntity entity = Services.getBridge(fkMap[0].get(name)).createEntity();
-								entity.setId((Integer) res);
-								return entity;
-							} catch (Exception e) {
-								e.printStackTrace();
-							}
-							return null;
-						}
-						return res;
-					});
-			list.add(newEntity);
+			String res = (String) rs.getObject(1);
+			if (res.endsWith("_enum")) {
+				enumTables.add(res);
+			}
 		}
 		rs.close();
-		return list;
+		cacheTables(enumTables);
 	}
-	
+
 	/**
+	 * @throws Exception 
 	 *
 	 */
+	public void cacheTables(Collection<String> tables) throws Exception {
+		if (tables.size() > 0) {
+			Map<String, List<IEntity>> enumsTables = (Map<String, List<IEntity>>) Cache.get(Globals.EnumTables);
+			if (enumsTables == null) {
+				Cache.put(Globals.EnumTables, enumsTables = new HashMap<String, List<IEntity>>());
+			}
+			enumsTables.putAll(_dbCollect.collect(tables.toArray(new String[tables.size()])));
+		}
+	}
+
 	@Override
 	public Map<String, List<IEntity>> collect(String[] tables) throws Exception {
-		MySqlConnection connection = _connectionPool.pop();
-		Map<String, List<IEntity>> tablesMap = new HashMap<String, List<IEntity>>();
-		for (String table : tables) {
-			tablesMap.put(table, collect(connection, table, ""));
-		}
-		_connectionPool.push(connection);
-		return tablesMap;
+		return _dbCollect.collect(tables);
 	}
-	
-	/**
-	 *
-	 */
+
+	@Override
+	public List<IEntity> collect(String table) throws Exception {
+		return _dbCollect.collect(table);
+	}
+
 	@Override
 	public List<IEntity> filter(List<QueryContainer> queryContainers) throws Exception {
-		MySqlConnection connection = _connectionPool.pop();
-		List<IEntity> resultsList = filter(queryContainers, connection);
-		_connectionPool.push(connection);
-		return resultsList;
+		return _dbFilter.filter(queryContainers);
 	}
 
-	/**
-	 * 
-	 * @param queryContainers
-	 * @param connection
-	 * @return
-	 * @throws Exception
-	 */
-	public List<IEntity> filter(List<QueryContainer> queryContainers, MySqlConnection connection) throws Exception {
-		Map<String, List<QueryContainer>> map = new HashMap<String, List<QueryContainer>>();
-		for (QueryContainer container : queryContainers) {
-			IEntity entity = container.getQueryEntity();
-			String table = entity.getClass().getAnnotation(Table.class).Name();
-			List<QueryContainer> list = map.get(table);
-			if (list == null) {
-				map.put(table, list = new ArrayList<QueryContainer>());
-			}
-			list.add(container);
-		}
-		
-		List<IEntity> resultsList = new ArrayList<IEntity>();
-		for (Entry<String, List<QueryContainer>> entry : map.entrySet()) {
-			resultsList.addAll(filterByEntityType(entry.getValue(), connection));
-		}
-		return resultsList;
-	}
-	
-	/**
-	 * 
-	 * @param queryContainers
-	 * @param connection
-	 * @return
-	 * @throws Exception
-	 */
-	private List<IEntity> filterByEntityType(List<QueryContainer> queryContainers, MySqlConnection connection) throws Exception {
-		Map<String, List<String>> whereMap = new HashMap<String, List<String>>();
-		
-		for (QueryContainer container : queryContainers) {
-			IEntity entity = container.getQueryEntity();
-			Map<String, String> querySigns = container.getQueryMap();
-			String table = entity.getClass().getAnnotation(Table.class).Name();
-			List<String> whereList = whereMap.get(table);
-			if (whereList == null) {
-				whereMap.put(table, whereList = new ArrayList<String>());
-			}
-			IEntityBridge entityBridge = Services.getBridge(table);
-			List<String> whereListF = whereList;
-			entityBridge.collectFromEntity(entity, 
-					(index, name, value) -> {
-						String querySign = querySigns.get(name);
-						if (querySign != null && value != null) {
-							String valueStr = "";
-							if (_comperatorsMap.keySet().contains(querySign)) {
-								valueStr = _comperatorsMap.get(querySign).replace(StringValueSign, (String) value);
-								querySign = "like";
-							}
-							else if (value instanceof String) {
-								valueStr = "'" + value + "'";
-							}
-							else if (value instanceof IEntity) {
-								valueStr = ((IEntity) value).getId().toString();
-							}
-							else {
-								valueStr = value.toString();
-							}
-							whereListF.add(String.format("%s %s %s", name, querySign, valueStr));
-						}
-					});
-		}
-		List<IEntity> resultsList = new ArrayList<IEntity>();
-		for (Entry<String, List<String>> entry : whereMap.entrySet()) {
-			String table = entry.getKey();
-			List<String> whereList = entry.getValue();
-			String where = whereList.size() > 0 ? ("where " + String.join(" and ", whereList)) : "";
-			List<IEntity> list = collect(connection, table, where);
-			if (list.size() == 1) {
-				IEntity entity = list.get(0);
-				for (QueryContainer container : queryContainers) {
-					if (container.getNext() != null && container.getNext().size() > 0) {
-						for (QueryContainer qc : container.getNext()) {
-							IEntity nextEntity = qc.getQueryEntity();
-							String nextTable = nextEntity.getClass().getAnnotation(Table.class).Name();
-							IEntityBridge nextEntityBridge = Services.getBridge(nextTable);
-							nextEntityBridge.populateEntity(nextEntity, 
-									(index, name, value) -> {
-										if (name.equals(table + "_fk")) {
-											return entity;
-										}
-										return value;
-									});
-						}
-						list.addAll(filter(container.getNext(), connection));
-					}
-				}
-			}
-			
-			resultsList.addAll(list);
-		}
-		return resultsList;
+	@Override
+	public List<IEntity> filter(QueryContainer queryContainer) throws Exception {
+		return _dbFilter.filter(queryContainer);
 	}
 
-	/**
-	 * @param table
-	 * @param entity
-	 * @param entityBridge
-	 * @return
-	 * @throws Exception
-	 */
-	private String createInsertStr(String table, IEntity entity, IEntityBridge entityBridge) throws Exception { 
-		List<String> values = new ArrayList<String>();
-		List<String> names = new ArrayList<String>();
-		entityBridge.collectFromEntity(entity, 
-				(index, name, value) -> {
-					if (!"id".equals(name)) {
-						names.add(name);
-						values.add("?");
-					}
-				});
-		return String.format("insert into %s (%s) values (%s)", 
-				table, String.join(",", names), String.join(",", values));
+	@Override
+	public List<IEntity> filter(IEntity entity) throws Exception {
+		return _dbFilter.filter(entity);
 	}
 
-	/**
-	 *
-	 */
 	@Override
 	public Integer insert(IEntity entity) throws Exception {
-		String table = entity.getClass().getAnnotation(Table.class).Name();
-		IEntityBridge entityBridge = Services.getBridge(table);
-		MySqlConnection connection = _connectionPool.pop();
-		PreparedStatement ps = connection.getPreparedStatement(StatementType.Insert, table);
-		if (ps == null) {
-			String insertStr = createInsertStr(table, entity, entityBridge);
-			ps = connection.createPreparedStatement(StatementType.Insert, table, insertStr);
-		}
-		PreparedStatement psToRun = ps;
-		entityBridge.collectFromEntity(entity, 
-				(index, name, value) -> {
-					if (index > 0) {
-						psToRun.setObject(index, value);
-					}
-				});
-		ps.executeUpdate();
-		try (ResultSet generatedKeys = ps.getGeneratedKeys()) {
-			if (generatedKeys.next()) {
-				Integer generatedKey = generatedKeys.getInt(1);
-				entity.setId(generatedKey);
-				_connectionPool.push(connection);
-				return generatedKey;
-			}
-		}
-		_connectionPool.push(connection);
-		return -1;
+		return _dbInsert.insert(entity);
 	}
 
-	/**
-	 * @param table
-	 * @param entity
-	 * @param entityBridge
-	 * @return
-	 * @throws Exception
-	 */
-	private String createUpdateStr(String table, IEntity entity, IEntityBridge entityBridge) throws Exception {
-		List<String> values = new ArrayList<String>();
-		entityBridge.collectFromEntity(entity, 
-				(index, name, value) -> {
-					if (!"id".equals(name)) {
-						values.add(String.format("%s = ?", name));
-					}
-				});
-		return String.format("update %s set %s where id = ?;", 
-				table, String.join(",", values));
-	}
-
-	/**
-	 *
-	 */
 	@Override
 	public void update(IEntity entity) throws Exception {
-		String table = entity.getClass().getAnnotation(Table.class).Name();
-		IEntityBridge entityBridge = Services.getBridge(table);
-		MySqlConnection connection = _connectionPool.pop();
-		PreparedStatement ps = connection.getPreparedStatement(StatementType.Update, table);
-		if (ps == null) {
-			String updateStr = createUpdateStr(table, entity, entityBridge);
-			ps = connection.createPreparedStatement(StatementType.Update, table, updateStr);
-		}
-		PreparedStatement psToRun = ps;
-		int[] i = new int[] {0};
-		entityBridge.collectFromEntity(entity, 
-				(index, name, value) -> {
-					if (!"id".equals(name)) {
-						psToRun.setObject(index, value);
-						i[0]++;
-					}
-				});
-		ps.setObject(i[0] + 1, entity.getId());
-		ps.executeUpdate();
-		_connectionPool.push(connection);
+		_dbUpdate.update(entity);
 	}
 
-	/**
-	 *
-	 */
 	@Override
 	public void remove(IEntity entity) throws Exception {
-		String table = entity.getClass().getAnnotation(Table.class).Name();
-		MySqlConnection connection = _connectionPool.pop();
-		PreparedStatement ps = connection.getPreparedStatement(StatementType.Remove, table);
-		if (ps == null) {
-			String removeStr = String.format("delete from %s where id = ?;", table);
-			ps = connection.createPreparedStatement(StatementType.Remove, table, removeStr);
-		}
-		ps.setObject(1, entity.getId());
-		ps.executeUpdate();
-		_connectionPool.push(connection);
+		_dbRemove.remove(entity);
+	}
+
+	@Override
+	public void remove(List<QueryContainer> queryContainers) throws Exception {
+		_dbRemove.remove(queryContainers);
 	}
 
 	/**
